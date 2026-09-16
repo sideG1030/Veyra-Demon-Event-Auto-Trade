@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra Demon Event Auto Trade
 // @namespace    https://github.com/sideG1030
-// @version      1.6.7
+// @version      1.6.9
 // @description  Automatic Veyra event trade planner/executor with mixed cargo, daily planning, recovery, and restock handling.
 // @homepageURL  https://github.com/sideG1030/Veyra-Demon-Event-Auto-Trade
 // @updateURL    https://raw.githubusercontent.com/sideG1030/Veyra-Demon-Event-Auto-Trade/main/veyra-demon-event-auto-trade.user.js
@@ -45,7 +45,7 @@
      *
      ******************************************************************/
 
-    const SCRIPT_VERSION = '1.6.7';
+    const SCRIPT_VERSION = '1.6.9';
 
     const STORAGE_KEY = 'veyra_auto_trader_v1';
 
@@ -1687,10 +1687,12 @@
         );
 
         for (const leg of candidates) {
-            leg.strategyRole =
-                leg.transport.id === TRANSPORTS.horse.id
-                    ? 'reposition'
-                    : 'trade';
+            /*
+             * A normal Warhorse leg is a trade. It is only a reposition
+             * when the explicit hub-improvement rule above chose the horse
+             * instead of a full Buffalo.
+             */
+            leg.strategyRole = 'trade';
         }
 
         return candidates;
@@ -1777,6 +1779,27 @@
                             );
 
                         for (const leg of candidateLegs) {
+                            const lastStep =
+                                state.steps.length
+                                    ? state.steps[
+                                        state.steps.length - 1
+                                    ]
+                                    : null;
+
+                            /*
+                             * A true Warhorse reposition must be followed by
+                             * a Bulk Buffalo leg from the new city. Otherwise
+                             * it is not serving its intended purpose.
+                             */
+                            if (
+                                lastStep?.strategyRole ===
+                                    'reposition' &&
+                                leg.strategyRole !==
+                                    'bulk'
+                            ) {
+                                continue;
+                            }
+
                             const newTime =
                                 state.timeUsed +
                                 leg.travelMinutes;
@@ -2428,7 +2451,7 @@
 
                 const explicitError =
                     statusChanged &&
-                    /error|failed|invalid|cannot|not enough|limit|exceed/i.test(
+                    /error|failed|invalid|cannot|not enough|don't have enough|do not have enough|limit|exceed/i.test(
                         statusNow
                     );
 
@@ -2469,7 +2492,7 @@
 
             let outcome =
                 await waitForAnyResponse(
-                    2500
+                    5000
                 );
 
             if (
@@ -2499,75 +2522,23 @@
                 );
 
             /*
-             * Strategy 2: only when button.click() produced absolutely no
-             * response, call requestSubmit(), which directly invokes the
-             * form's submit path.
+             * IMPORTANT:
+             * Never submit the SAME sale twice in one attempt.
+             *
+             * Previously, if button.click() succeeded server-side but Safari
+             * had not yet reflected the new storage value, the script called
+             * requestSubmit() as a fallback. That could submit the exact same
+             * quantity a second time and produce the game's
+             * "not enough resource to sell" error.
+             *
+             * So after one button.click(), we only REFRESH AND VERIFY. If the
+             * sale truly did not happen, the next loop iteration gets a fresh
+             * form and performs one new click.
              */
-            if (!acknowledged) {
-                if (
-                    typeof form.requestSubmit ===
-                    'function'
-                ) {
-                    form.requestSubmit(
-                        button
-                    );
-                } else if (
-                    typeof SubmitEvent ===
-                    'function'
-                ) {
-                    form.dispatchEvent(
-                        new SubmitEvent(
-                            'submit',
-                            {
-                                bubbles: true,
-                                cancelable: true,
-                                submitter: button
-                            }
-                        )
-                    );
-                } else {
-                    form.dispatchEvent(
-                        new Event(
-                            'submit',
-                            {
-                                bubbles: true,
-                                cancelable: true
-                            }
-                        )
-                    );
-                }
-
-                outcome =
-                    await waitForAnyResponse(
-                        3000
-                    );
-
-                if (
-                    outcome?.explicitError
-                ) {
-                    throw new Error(
-                        `Sell failed for ${resource}: ${outcome.statusNow}`
-                    );
-                }
-
-                acknowledged =
-                    Boolean(
-                        outcome &&
-                        (
-                            outcome.storedChanged ||
-                            outcome.silverChanged ||
-                            (
-                                outcome.statusChanged &&
-                                !outcome.explicitError
-                            )
-                        )
-                    );
-            }
 
             /*
              * Whether acknowledged or not, rebuild the target market once
-             * and inspect authoritative-looking fresh values before deciding
-             * to submit again.
+             * and inspect fresh values before deciding whether to retry.
              */
             if (refreshCity) {
                 await forceRefreshMarket(
@@ -2838,9 +2809,14 @@
         };
 
         /*
-         * Process EVERY resource in the queue. A transient failure for one
-         * resource must not discard the rest of the mixed cargo and must not
-         * stop the whole trader.
+         * Process EVERY resource in the queue ONE AT A TIME.
+         *
+         * Each resource gets its own Sell form submission. Quantities from
+         * different resource types are never added together and are never
+         * submitted through the same form.
+         *
+         * A transient failure for one resource must not discard the rest of
+         * the mixed cargo and must not stop the whole trader.
          */
         for (const resource of RESOURCES) {
             let quantity =
