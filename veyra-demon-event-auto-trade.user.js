@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra Demon Event Auto Trade
 // @namespace    https://github.com/sideG1030
-// @version      1.6.5
+// @version      1.6.6
 // @description  Automatic Veyra event trade planner/executor with mixed cargo, daily planning, recovery, and restock handling.
 // @homepageURL  https://github.com/sideG1030/Veyra-Demon-Event-Auto-Trade
 // @updateURL    https://raw.githubusercontent.com/sideG1030/Veyra-Demon-Event-Auto-Trade/main/veyra-demon-event-auto-trade.user.js
