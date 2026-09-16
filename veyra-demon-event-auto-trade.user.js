@@ -45,7 +45,7 @@
      *
      ******************************************************************/
 
-    const SCRIPT_VERSION = '1.6.5';
+    const SCRIPT_VERSION = '1.6.6';
 
     const STORAGE_KEY = 'veyra_auto_trader_v1';
 
@@ -2218,7 +2218,9 @@
         let info = parseResourceCard(resource);
 
         if (!info) {
-            throw new Error(`Could not find ${resource}.`);
+            throw new Error(
+                `Could not find ${resource}.`
+            );
         }
 
         let remaining = Math.min(
@@ -2232,12 +2234,29 @@
         }
 
         let soldTotal = 0;
-        let failedAttempts = 0;
 
+        /*
+         * The live HTML shows Sell as a normal form with a submit button:
+         *
+         *   <form class="ec-expedition-form">
+         *     <input type="number" ...>
+         *     <button type="submit">Sell</button>
+         *     <p class="ec-action-status"></p>
+         *   </form>
+         *
+         * The safest automation is therefore to imitate the user's real
+         * button click FIRST. Only if that causes absolutely no response do
+         * we fall back to requestSubmit()/SubmitEvent.
+         *
+         * Most importantly, any non-error action-status response is treated
+         * as acknowledgement from the game's own handler. We then refresh
+         * the market and verify before ever attempting another submission.
+         * This avoids both false failures from stale DOM and double-selling.
+         */
         for (
-            let attempt = 0;
-            attempt < 6 && remaining > 0;
-            attempt++
+            let batch = 0;
+            batch < 6 && remaining > 0;
+            batch++
         ) {
             const refreshCity =
                 expectedCity ||
@@ -2250,8 +2269,7 @@
                     );
 
                 if (!actualCity) {
-                    failedAttempts++;
-                    await sleep(400);
+                    await sleep(500);
                     continue;
                 }
             }
@@ -2259,8 +2277,7 @@
             info = parseResourceCard(resource);
 
             if (!info) {
-                failedAttempts++;
-                await sleep(400);
+                await sleep(500);
                 continue;
             }
 
@@ -2315,17 +2332,28 @@
             }
 
             if (!input || !button) {
-                failedAttempts++;
+                throw new Error(
+                    `Sell controls missing for ${resource}. ` +
+                    `Current panel: ${getPanelNote() || 'unknown'}.`
+                );
+            }
 
-                if (failedAttempts >= 3) {
-                    throw new Error(
-                        `Sell controls missing for ${resource} after repeated refreshes. ` +
-                        `Current panel: ${getPanelNote() || 'unknown'}.`
-                    );
-                }
+            setInputValue(
+                input,
+                amount
+            );
 
-                await sleep(500);
-                continue;
+            await sleep(120);
+
+            if (
+                typeof input.checkValidity ===
+                    'function' &&
+                !input.checkValidity()
+            ) {
+                throw new Error(
+                    `Sell quantity ${amount} is invalid for ${resource}. ` +
+                    `Input max is ${input.max || 'unknown'}.`
+                );
             }
 
             const storedBefore =
@@ -2334,30 +2362,6 @@
             const silverBefore =
                 getSilver();
 
-            setStatus(
-                `Selling ${amount} ${resource}...`
-            );
-
-            setInputValue(
-                input,
-                amount
-            );
-
-            await sleep(150);
-
-            /*
-             * The actual Trading Post HTML uses a normal form:
-             *
-             *   <form class="ec-expedition-form">
-             *     <label>Quantity to sell<input ...></label>
-             *     <button type="submit">Sell</button>
-             *     <p class="ec-action-status"></p>
-             *   </form>
-             *
-             * Submit the FORM rather than synthetically clicking the button.
-             * This directly triggers the site's submit handler and is more
-             * reliable when the Trading Post is hidden in the background.
-             */
             const statusEl =
                 form.querySelector(
                     '.ec-action-status'
@@ -2368,213 +2372,266 @@
                     statusEl?.textContent
                 );
 
-            const mutation =
-                waitForBodyMutation();
-
-            if (
-                typeof form.requestSubmit ===
-                'function'
-            ) {
-                form.requestSubmit(
-                    button
-                );
-            } else {
-                /*
-                 * Older-browser fallback: dispatch a real submit event.
-                 */
-                form.dispatchEvent(
-                    new SubmitEvent(
-                        'submit',
-                        {
-                            bubbles: true,
-                            cancelable: true,
-                            submitter: button
-                        }
-                    )
-                );
-            }
-
-            await mutation;
-
-            let result = await waitFor(
-                () => {
-                    const nowInfo =
-                        parseResourceCard(
-                            resource
-                        );
-
-                    const silverNow =
-                        getSilver();
-
-                    const currentForm =
-                        findActionForm(
-                            resource,
-                            'Sell'
-                        );
-
-                    const currentStatus =
-                        normalize(
-                            currentForm
-                                ?.querySelector(
-                                    '.ec-action-status'
-                                )
-                                ?.textContent
-                        );
-
-                    const storedChanged =
-                        nowInfo &&
-                        nowInfo.stored <
-                            storedBefore;
-
-                    const silverChanged =
-                        Number.isFinite(
-                            silverBefore
-                        ) &&
-                        Number.isFinite(
-                            silverNow
-                        ) &&
-                        silverNow >
-                            silverBefore;
-
-                    const statusChanged =
-                        currentStatus &&
-                        currentStatus !==
-                            statusBefore;
-
-                    if (
-                        storedChanged ||
-                        silverChanged
-                    ) {
-                        return {
-                            info: nowInfo,
-                            silverNow,
-                            storedChanged,
-                            silverChanged,
-                            status:
-                                currentStatus
-                        };
-                    }
-
-                    /*
-                     * A changed status alone is not treated as success, but
-                     * return it as a diagnostic if it explicitly reports an
-                     * error so we don't blindly retry an invalid request.
-                     */
-                    if (
-                        statusChanged &&
-                        /error|failed|invalid|cannot|not enough|limit/i.test(
-                            currentStatus
-                        )
-                    ) {
-                        return {
-                            explicitError:
-                                currentStatus,
-                            info: nowInfo,
-                            silverNow
-                        };
-                    }
-
-                    return null;
-                },
-                7000,
-                100
+            setStatus(
+                `Selling ${amount} ${resource}...`
             );
 
-            if (
-                result?.explicitError
-            ) {
-                throw new Error(
-                    `Sell failed for ${resource}: ${result.explicitError}`
-                );
-            }
-
-            if (!result && refreshCity) {
-                await forceRefreshMarket(
-                    refreshCity
-                );
-
-                const refreshedInfo =
+            const readOutcome = () => {
+                const nowInfo =
                     parseResourceCard(
                         resource
                     );
 
-                const refreshedSilver =
+                const silverNow =
                     getSilver();
 
+                const currentForm =
+                    findActionForm(
+                        resource,
+                        'Sell'
+                    );
+
+                const statusNow =
+                    normalize(
+                        currentForm
+                            ?.querySelector(
+                                '.ec-action-status'
+                            )
+                            ?.textContent
+                    );
+
                 const storedChanged =
-                    refreshedInfo &&
-                    refreshedInfo.stored <
-                        storedBefore;
+                    Boolean(
+                        nowInfo &&
+                        nowInfo.stored <
+                            storedBefore
+                    );
 
                 const silverChanged =
                     Number.isFinite(
                         silverBefore
                     ) &&
                     Number.isFinite(
-                        refreshedSilver
+                        silverNow
                     ) &&
-                    refreshedSilver >
+                    silverNow >
                         silverBefore;
 
-                if (
-                    storedChanged ||
-                    silverChanged
-                ) {
-                    result = {
-                        info: refreshedInfo,
-                        silverNow: refreshedSilver,
-                        storedChanged,
-                        silverChanged
-                    };
-                }
-            }
+                const statusChanged =
+                    Boolean(
+                        statusNow &&
+                        statusNow !==
+                            statusBefore
+                    );
 
-            if (!result) {
-                failedAttempts++;
+                const explicitError =
+                    statusChanged &&
+                    /error|failed|invalid|cannot|not enough|limit|exceed/i.test(
+                        statusNow
+                    );
 
-                setStatus(
-                    `Retrying sale of ${resource} (${failedAttempts}/3)...`
+                return {
+                    nowInfo,
+                    silverNow,
+                    statusNow,
+                    storedChanged,
+                    silverChanged,
+                    statusChanged,
+                    explicitError
+                };
+            };
+
+            const waitForAnyResponse =
+                async timeout =>
+                    waitFor(
+                        () => {
+                            const out =
+                                readOutcome();
+
+                            return (
+                                out.storedChanged ||
+                                out.silverChanged ||
+                                out.statusChanged
+                            )
+                                ? out
+                                : null;
+                        },
+                        timeout,
+                        100
+                    );
+
+            /*
+             * Strategy 1: exact equivalent of the user's manual action.
+             */
+            button.click();
+
+            let outcome =
+                await waitForAnyResponse(
+                    2500
                 );
 
-                if (failedAttempts >= 3) {
-                    throw new Error(
-                        `Sale of ${amount} ${resource} failed after 3 fresh-form attempts. ` +
-                        `Stored remains ${storedBefore}.`
-                    );
-                }
-
-                await sleep(600);
-                continue;
-            }
-
-            failedAttempts = 0;
-
-            let afterInfo =
-                result.info;
-
             if (
-                !afterInfo ||
-                afterInfo.stored >= storedBefore
+                outcome?.explicitError
             ) {
-                if (refreshCity) {
-                    await forceRefreshMarket(
-                        refreshCity
+                throw new Error(
+                    `Sell failed for ${resource}: ${outcome.statusNow}`
+                );
+            }
+
+            /*
+             * If the game's own action-status changed to a non-error message,
+             * regard the submit handler as having acknowledged the action.
+             * Do not submit again yet; refresh and verify server state first.
+             */
+            let acknowledged =
+                Boolean(
+                    outcome &&
+                    (
+                        outcome.storedChanged ||
+                        outcome.silverChanged ||
+                        (
+                            outcome.statusChanged &&
+                            !outcome.explicitError
+                        )
+                    )
+                );
+
+            /*
+             * Strategy 2: only when button.click() produced absolutely no
+             * response, call requestSubmit(), which directly invokes the
+             * form's submit path.
+             */
+            if (!acknowledged) {
+                if (
+                    typeof form.requestSubmit ===
+                    'function'
+                ) {
+                    form.requestSubmit(
+                        button
+                    );
+                } else if (
+                    typeof SubmitEvent ===
+                    'function'
+                ) {
+                    form.dispatchEvent(
+                        new SubmitEvent(
+                            'submit',
+                            {
+                                bubbles: true,
+                                cancelable: true,
+                                submitter: button
+                            }
+                        )
+                    );
+                } else {
+                    form.dispatchEvent(
+                        new Event(
+                            'submit',
+                            {
+                                bubbles: true,
+                                cancelable: true
+                            }
+                        )
                     );
                 }
 
-                afterInfo =
-                    parseResourceCard(
-                        resource
+                outcome =
+                    await waitForAnyResponse(
+                        3000
+                    );
+
+                if (
+                    outcome?.explicitError
+                ) {
+                    throw new Error(
+                        `Sell failed for ${resource}: ${outcome.statusNow}`
+                    );
+                }
+
+                acknowledged =
+                    Boolean(
+                        outcome &&
+                        (
+                            outcome.storedChanged ||
+                            outcome.silverChanged ||
+                            (
+                                outcome.statusChanged &&
+                                !outcome.explicitError
+                            )
+                        )
                     );
             }
 
-            let actuallySold =
-                afterInfo &&
-                afterInfo.stored <
+            /*
+             * Whether acknowledged or not, rebuild the target market once
+             * and inspect authoritative-looking fresh values before deciding
+             * to submit again.
+             */
+            if (refreshCity) {
+                await forceRefreshMarket(
+                    refreshCity
+                );
+            }
+
+            await sleep(200);
+
+            const refreshedInfo =
+                parseResourceCard(
+                    resource
+                );
+
+            const refreshedSilver =
+                getSilver();
+
+            const soldByStorage =
+                refreshedInfo &&
+                refreshedInfo.stored <
                     storedBefore
                     ? storedBefore -
-                        afterInfo.stored
-                    : amount;
+                        refreshedInfo.stored
+                    : 0;
+
+            const saleVisibleInSilver =
+                Number.isFinite(
+                    silverBefore
+                ) &&
+                Number.isFinite(
+                    refreshedSilver
+                ) &&
+                refreshedSilver >
+                    silverBefore;
+
+            /*
+             * Prefer the actual storage delta. If the game's own handler
+             * acknowledged success and silver increased but storage still
+             * renders stale, count this batch as sold and move on; the next
+             * fresh market render will reconcile it.
+             */
+            let actuallySold =
+                soldByStorage;
+
+            if (
+                actuallySold <= 0 &&
+                acknowledged &&
+                saleVisibleInSilver
+            ) {
+                actuallySold =
+                    amount;
+            }
+
+            if (actuallySold <= 0) {
+                /*
+                 * Nothing indicates acceptance. Rebuild the form and retry
+                 * this SAME amount on the next loop iteration. We have not
+                 * decremented remaining, so no cargo is lost from tracking.
+                 */
+                setStatus(
+                    `Sell did not register for ${resource}; retrying on fresh form...`
+                );
+
+                await sleep(700);
+                continue;
+            }
 
             actuallySold =
                 Math.max(
@@ -2591,13 +2648,13 @@
             remaining -=
                 actuallySold;
 
-            await sleep(150);
+            await sleep(200);
         }
 
         if (remaining > 0) {
             throw new Error(
                 `Could not finish selling ${resource}. ` +
-                `${remaining} still expected to be sold.`
+                `${remaining} still remains after repeated fresh-form attempts.`
             );
         }
 
