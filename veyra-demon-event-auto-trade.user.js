@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra Demon Event Auto Trade
 // @namespace    https://github.com/sideG1030
-// @version      1.6.6
+// @version      1.6.7
 // @description  Automatic Veyra event trade planner/executor with mixed cargo, daily planning, recovery, and restock handling.
 // @homepageURL  https://github.com/sideG1030/Veyra-Demon-Event-Auto-Trade
 // @updateURL    https://raw.githubusercontent.com/sideG1030/Veyra-Demon-Event-Auto-Trade/main/veyra-demon-event-auto-trade.user.js
@@ -45,7 +45,7 @@
      *
      ******************************************************************/
 
-    const SCRIPT_VERSION = '1.6.6';
+    const SCRIPT_VERSION = '1.6.7';
 
     const STORAGE_KEY = 'veyra_auto_trader_v1';
 
@@ -164,6 +164,7 @@
             needsRecalcAtArrival: false,
             manualJourneyDestination: null,
             arrivalBaseline: null,
+            pendingArrivalSales: null,
             lastGameSeconds: null,
             gameClockOffsetSeconds: null,
             gameClockSyncedAt: null,
@@ -1930,6 +1931,7 @@
             departureGameSeconds: null,
             expectedArrivalGameSeconds: null,
             arrivalBaseline: null,
+            pendingArrivalSales: null,
             planValidUntilReal: validUntil,
             needsRecalcAtArrival: false,
             lastError: null,
@@ -2744,7 +2746,10 @@
         baselineStored
     ) {
         if (!destination) {
-            return {};
+            return {
+                complete: true,
+                sold: {}
+            };
         }
 
         const actualCity =
@@ -2756,38 +2761,277 @@
             !actualCity ||
             actualCity !== destination
         ) {
-            throw new Error(
-                `Could not establish caravan at ${destination} before selling arrived cargo.`
-            );
+            return {
+                complete: false,
+                sold: {},
+                reason:
+                    `Could not establish caravan at ${destination}.`
+            };
         }
 
-        const after = snapshotStored();
-        const arrived = {};
+        let state = loadState();
 
-        for (const resource of RESOURCES) {
-            arrived[resource] = Math.max(
-                0,
-                (after[resource] || 0) -
-                (baselineStored?.[resource] || 0)
-            );
+        /*
+         * Build the queue ONCE, before any sales happen. This is important
+         * for mixed cargo. After we sell the first resource, the live stored
+         * quantities change; recomputing the whole arrival delta from scratch
+         * can make the remaining cargo harder to track.
+         */
+        if (
+            !state.pendingArrivalSales ||
+            state.pendingArrivalSales.destination !==
+                destination
+        ) {
+            const after =
+                snapshotStored();
+
+            const pending = {};
+
+            for (const resource of RESOURCES) {
+                const quantity =
+                    Math.max(
+                        0,
+                        (after[resource] || 0) -
+                        (baselineStored?.[resource] || 0)
+                    );
+
+                if (quantity > 0) {
+                    pending[resource] =
+                        quantity;
+                }
+            }
+
+            patchState({
+                pendingArrivalSales: {
+                    destination,
+                    pending,
+                    sold: {},
+                    createdAt:
+                        Date.now()
+                }
+            });
+
+            state = loadState();
         }
 
+        const queue =
+            state.pendingArrivalSales;
+
+        if (
+            !queue ||
+            queue.destination !== destination
+        ) {
+            return {
+                complete: false,
+                sold: {},
+                reason:
+                    'Arrival sale queue could not be created.'
+            };
+        }
+
+        const pending = {
+            ...(queue.pending || {})
+        };
+
+        const sold = {
+            ...(queue.sold || {})
+        };
+
+        /*
+         * Process EVERY resource in the queue. A transient failure for one
+         * resource must not discard the rest of the mixed cargo and must not
+         * stop the whole trader.
+         */
         for (const resource of RESOURCES) {
-            const quantity =
-                arrived[resource] || 0;
+            let quantity =
+                Number(
+                    pending[resource] || 0
+                );
 
             if (quantity <= 0) {
                 continue;
             }
 
-            await sellResource(
-                resource,
-                quantity,
-                destination
+            setStatus(
+                `Selling arrived cargo: ${resource} (${quantity})...`
             );
+
+            try {
+                const amountSold =
+                    await sellResource(
+                        resource,
+                        quantity,
+                        destination
+                    );
+
+                if (amountSold > 0) {
+                    sold[resource] =
+                        (
+                            Number(
+                                sold[resource] || 0
+                            ) +
+                            amountSold
+                        );
+
+                    quantity =
+                        Math.max(
+                            0,
+                            quantity -
+                            amountSold
+                        );
+
+                    pending[resource] =
+                        quantity;
+
+                    /*
+                     * Persist after EACH resource. If Safari, the page, or a
+                     * later resource fails, the next automation tick resumes
+                     * exactly where it left off instead of selling only the
+                     * first cargo type.
+                     */
+                    patchState({
+                        pendingArrivalSales: {
+                            destination,
+                            pending: {
+                                ...pending
+                            },
+                            sold: {
+                                ...sold
+                            },
+                            createdAt:
+                                queue.createdAt ||
+                                Date.now()
+                        }
+                    });
+                }
+
+            } catch (error) {
+                errorLog(
+                    `Arrival sale retry needed for ${resource}:`,
+                    error
+                );
+
+                /*
+                 * Leave this resource in the queue and continue trying the
+                 * other resource types. Do NOT throw and stop automation.
+                 */
+                patchState({
+                    pendingArrivalSales: {
+                        destination,
+                        pending: {
+                            ...pending
+                        },
+                        sold: {
+                            ...sold
+                        },
+                        createdAt:
+                            queue.createdAt ||
+                            Date.now()
+                    },
+                    status:
+                        `Will retry ${resource}; continuing remaining arrival cargo`
+                });
+            }
         }
 
-        return arrived;
+        /*
+         * Freshly verify all pending entries. If a previous sale succeeded
+         * server-side but our DOM verification missed it, cap each pending
+         * quantity to what is actually still stored now.
+         */
+        await ensureCaravanMarket(
+            destination
+        );
+
+        for (const resource of RESOURCES) {
+            const expected =
+                Number(
+                    pending[resource] || 0
+                );
+
+            if (expected <= 0) {
+                continue;
+            }
+
+            const info =
+                parseResourceCard(
+                    resource
+                );
+
+            if (!info) {
+                continue;
+            }
+
+            /*
+             * We cannot infer how much of pre-existing storage belongs to the
+             * arrival, so only reduce the queue when live storage is below the
+             * expected unsold arrival amount.
+             */
+            if (info.stored < expected) {
+                const implicitlySold =
+                    expected -
+                    info.stored;
+
+                sold[resource] =
+                    (
+                        Number(
+                            sold[resource] || 0
+                        ) +
+                        implicitlySold
+                    );
+
+                pending[resource] =
+                    info.stored;
+            }
+        }
+
+        const remainingResources =
+            RESOURCES.filter(
+                resource =>
+                    Number(
+                        pending[resource] || 0
+                    ) > 0
+            );
+
+        if (!remainingResources.length) {
+            patchState({
+                pendingArrivalSales: null
+            });
+
+            return {
+                complete: true,
+                sold
+            };
+        }
+
+        patchState({
+            pendingArrivalSales: {
+                destination,
+                pending: {
+                    ...pending
+                },
+                sold: {
+                    ...sold
+                },
+                createdAt:
+                    queue.createdAt ||
+                    Date.now()
+            },
+            status:
+                `Waiting to retry ${remainingResources.length} unsold cargo type` +
+                (
+                    remainingResources.length === 1
+                        ? ''
+                        : 's'
+                )
+        });
+
+        return {
+            complete: false,
+            sold,
+            pending,
+            remainingResources
+        };
     }
 
     async function unloadArrivedCaravan() {
@@ -2899,11 +3143,23 @@
         let arrived = {};
 
         if (baselineStored) {
-            arrived =
+            const saleResult =
                 await sellArrivedDelta(
                     actualDestination,
                     baselineStored
                 );
+
+            arrived =
+                saleResult.sold || {};
+
+            if (!saleResult.complete) {
+                /*
+                 * Keep the journey/arrival state intact. The next automation
+                 * tick will resume the pending mixed-cargo sales without user
+                 * input.
+                 */
+                return null;
+            }
 
         } else if (incomingStep) {
             /*
@@ -2948,6 +3204,7 @@
             expectedArrivalGameSeconds: null,
             manualJourneyDestination: null,
             arrivalBaseline: null,
+            pendingArrivalSales: null,
             caravanCity:
                 actualDestination ||
                 null
@@ -3931,11 +4188,22 @@
                         baseline?.destination ===
                         current.city
                     ) {
-                        arrived =
+                        const saleResult =
                             await sellArrivedDelta(
                                 current.city,
                                 baseline.stored
                             );
+
+                        arrived =
+                            saleResult.sold || {};
+
+                        if (!saleResult.complete) {
+                            /*
+                             * Leave inTransitStepIndex intact so the next
+                             * tick resumes the remaining resource types.
+                             */
+                            return;
+                        }
 
                     } else {
                         const storedNow =
