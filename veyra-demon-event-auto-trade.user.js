@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Veyra Demon Event Auto Trade
 // @namespace    https://github.com/sideG1030
-// @version      1.6.9
+// @version      1.7.0
 // @description  Automatic Veyra event trade planner/executor with mixed cargo, daily planning, recovery, and restock handling.
 // @homepageURL  https://github.com/sideG1030/Veyra-Demon-Event-Auto-Trade
 // @updateURL    https://raw.githubusercontent.com/sideG1030/Veyra-Demon-Event-Auto-Trade/main/veyra-demon-event-auto-trade.user.js
@@ -45,7 +45,7 @@
      *
      ******************************************************************/
 
-    const SCRIPT_VERSION = '1.6.9';
+    const SCRIPT_VERSION = '1.7.0';
 
     const STORAGE_KEY = 'veyra_auto_trader_v1';
 
@@ -160,6 +160,8 @@
             expectedArrivalReal: null,
             departureGameSeconds: null,
             expectedArrivalGameSeconds: null,
+            arrivalReloadKey: null,
+            arrivalReloadDone: false,
             planValidUntilReal: null,
             needsRecalcAtArrival: false,
             manualJourneyDestination: null,
@@ -1953,6 +1955,8 @@
             expectedArrivalReal: null,
             departureGameSeconds: null,
             expectedArrivalGameSeconds: null,
+            arrivalReloadKey: null,
+            arrivalReloadDone: false,
             arrivalBaseline: null,
             pendingArrivalSales: null,
             planValidUntilReal: validUntil,
@@ -3178,6 +3182,8 @@
             expectedArrivalReal: null,
             departureGameSeconds: null,
             expectedArrivalGameSeconds: null,
+            arrivalReloadKey: null,
+            arrivalReloadDone: false,
             manualJourneyDestination: null,
             arrivalBaseline: null,
             pendingArrivalSales: null,
@@ -3649,11 +3655,21 @@
 
         const state = loadState();
 
+        const arrivalReloadKey =
+            [
+                Date.now(),
+                stepIndex ?? 'immediate',
+                leg.from,
+                leg.to
+            ].join(':');
+
         patchState({
             inTransitStepIndex: stepIndex,
             expectedArrivalReal,
             departureGameSeconds,
             expectedArrivalGameSeconds,
+            arrivalReloadKey,
+            arrivalReloadDone: false,
             caravanCity: null,
             nextStepIndex:
                 stepIndex !== null
@@ -3723,6 +3739,8 @@
             expectedArrivalReal: null,
             departureGameSeconds: null,
             expectedArrivalGameSeconds: null,
+            arrivalReloadKey: null,
+            arrivalReloadDone: false,
             planValidUntilReal:
                 Date.now() +
                 secondsUntilReset() *
@@ -4087,6 +4105,43 @@
                           )
                         : 'Caravan travelling'
             });
+
+            return;
+        }
+
+        /*
+         * The game's trade token is tied to the page state and can expire
+         * while the caravan is travelling. Once the calculated game-time ETA
+         * is reached, perform ONE real page reload before touching the
+         * Trading Post. This gives the game a fresh trade token and lets the
+         * server resolve/auto-unload the arrived caravan.
+         *
+         * The flag is persisted in localStorage BEFORE reload, so after the
+         * page comes back the script continues automatically instead of
+         * reloading in a loop.
+         */
+        if (
+            state.running &&
+            state.inTransitStepIndex !== null &&
+            hasReachedExpectedGameArrival(
+                state,
+                clock.seconds
+            ) &&
+            !state.arrivalReloadDone
+        ) {
+            patchState({
+                arrivalReloadDone: true,
+                lastGameSeconds: clock.seconds,
+                status:
+                    'Caravan ETA reached — refreshing page for fresh trade token'
+            });
+
+            setTimeout(
+                () => {
+                    location.reload();
+                },
+                150
+            );
 
             return;
         }
